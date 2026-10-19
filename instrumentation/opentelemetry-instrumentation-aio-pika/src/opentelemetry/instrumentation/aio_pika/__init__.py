@@ -35,6 +35,24 @@ Run instrumented task
     if __name__ == "__main__":
         asyncio.run(main())
 
+Metrics
+-------
+
+When the ``OTEL_SEMCONV_STABILITY_OPT_IN`` environment variable contains
+``messaging`` (or ``messaging/dup``), the following metrics are reported with
+the ``messaging.system``, ``messaging.operation.name``,
+``messaging.destination.name``, ``server.address``, ``server.port`` and, on
+failures, ``error.type`` attributes:
+
+- ``messaging.client.operation.duration`` and ``messaging.client.sent.messages``
+  for ``Exchange.publish`` (the destination is the exchange name, or
+  ``amq.default`` for the default exchange)
+- ``messaging.process.duration`` and ``messaging.client.consumed.messages`` for
+  the callbacks registered with ``Queue.consume`` (the destination is the queue
+  name)
+
+A custom meter provider can be passed with ``instrument(meter_provider=...)``.
+
 API
 ---
 """

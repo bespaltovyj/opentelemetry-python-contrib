@@ -20,6 +20,24 @@ from opentelemetry.semconv.trace import (
 from opentelemetry.trace import Span, SpanKind, Tracer
 
 _DEFAULT_ATTRIBUTES = {MESSAGING_SYSTEM: "rabbitmq"}
+_DEFAULT_PORT = 5672
+
+
+def _get_server_address(channel: AbstractChannel) -> tuple[str | None, int]:
+    """Returns the host and port of the broker the channel is connected to."""
+    if hasattr(channel, "_connection"):
+        # aio_rmq 9.1 and above removed the connection attribute from the abstract listings
+        connection = channel._connection
+    else:
+        # aio_rmq 9.0.5 and below
+        connection = channel.connection
+    if hasattr(connection, "connection"):
+        # aio_rmq 7
+        url = connection.connection.url
+    else:
+        # aio_rmq 8
+        url = connection.url
+    return url.host, url.port or _DEFAULT_PORT
 
 
 class SpanBuilder:
@@ -46,22 +64,11 @@ class SpanBuilder:
         self._attributes[SpanAttributes.MESSAGING_DESTINATION] = destination
 
     def set_channel(self, channel: AbstractChannel):
-        if hasattr(channel, "_connection"):
-            # aio_rmq 9.1 and above removed the connection attribute from the abstract listings
-            connection = channel._connection
-        else:
-            # aio_rmq 9.0.5 and below
-            connection = channel.connection
-        if hasattr(connection, "connection"):
-            # aio_rmq 7
-            url = connection.connection.url
-        else:
-            # aio_rmq 8
-            url = connection.url
+        host, port = _get_server_address(channel)
         self._attributes.update(
             {
-                NET_PEER_NAME: url.host,
-                NET_PEER_PORT: url.port or 5672,
+                NET_PEER_NAME: host,
+                NET_PEER_PORT: port,
             }
         )
 
