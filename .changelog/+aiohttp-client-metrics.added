@@ -1,0 +1,1 @@
+`opentelemetry-instrumentation-aiohttp-client`: with the `http` semconv opt-in, report `http.client.request.body.size`, `http.client.response.body.size`, `http.client.active_requests` and `http.client.open_connections` metrics

@@ -54,6 +54,10 @@ from opentelemetry.semconv.attributes.http_attributes import (
     HTTP_RESPONSE_STATUS_CODE,
 )
 from opentelemetry.semconv.attributes.url_attributes import URL_FULL
+from opentelemetry.semconv.metrics import MetricInstruments
+from opentelemetry.semconv.metrics.http_metrics import (
+    HTTP_CLIENT_REQUEST_DURATION,
+)
 from opentelemetry.test.test_base import TestBase
 from opentelemetry.trace import Span, StatusCode
 from opentelemetry.util._importlib_metadata import entry_points
@@ -78,6 +82,10 @@ def run_with_test_server(runnable: typing.Callable, url: str, handler: typing.Ca
 
 
 SCOPE = "opentelemetry.instrumentation.aiohttp_client"
+_DURATION_METRICS = (
+    MetricInstruments.HTTP_CLIENT_DURATION,
+    HTTP_CLIENT_REQUEST_DURATION,
+)
 
 
 # pylint: disable=too-many-public-methods
@@ -111,7 +119,8 @@ class TestAioHttpIntegration(TestBase):
         )
 
     def _assert_metrics(self, num_metrics: int = 1):
-        metrics = self.get_sorted_metrics(SCOPE)
+        # only the duration metrics, the other client metrics are covered in test_aiohttp_client_metrics.py
+        metrics = [metric for metric in self.get_sorted_metrics(SCOPE) if metric.name in _DURATION_METRICS]
         self.assertEqual(len(metrics), num_metrics)
         return metrics
 
@@ -1230,7 +1239,8 @@ class TestAioHttpClientInstrumentor(TestBase):
         return finished_spans
 
     def _assert_metrics(self, num_metrics: int = 1):
-        metrics = self.get_sorted_metrics(SCOPE)
+        # only the duration metrics, the other client metrics are covered in test_aiohttp_client_metrics.py
+        metrics = [metric for metric in self.get_sorted_metrics(SCOPE) if metric.name in _DURATION_METRICS]
         self.assertEqual(len(metrics), num_metrics)
         return metrics
 

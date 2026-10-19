@@ -183,6 +183,20 @@ will replace the value of headers such as ``session-id`` and ``set-cookie`` with
 Note:
     The environment variable names used to capture HTTP headers are still experimental, and thus are subject to change.
 
+Metrics
+*******
+With the ``http`` (or ``http/dup``) ``OTEL_SEMCONV_STABILITY_OPT_IN`` mode, the
+following metrics are reported in addition to ``http.client.request.duration``:
+
+- ``http.client.request.body.size`` (sum of the sent chunks, or the
+  ``Content-Length`` request header) and ``http.client.response.body.size`` (the
+  ``Content-Length`` response header), with the same attributes as the duration
+- ``http.client.active_requests`` with the ``http.request.method``,
+  ``server.address`` and ``server.port`` attributes
+- ``http.client.open_connections`` with the ``http.connection.state``
+  (``active``/``idle``), ``server.address``, ``server.port`` and ``url.scheme``
+  attributes, observed from the connectors of the instrumented sessions
+
 API
 ---
 """
@@ -226,6 +240,9 @@ from opentelemetry.instrumentation._semconv import (
     _set_status,
     _StabilityMode,
 )
+from opentelemetry.instrumentation.aiohttp_client._metrics import (
+    get_connection_pool_observer,
+)
 from opentelemetry.instrumentation.aiohttp_client.package import _instruments
 from opentelemetry.instrumentation.aiohttp_client.version import __version__
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
@@ -235,7 +252,19 @@ from opentelemetry.instrumentation.utils import (
 )
 from opentelemetry.metrics import MeterProvider, get_meter
 from opentelemetry.propagate import inject
+from opentelemetry.semconv._incubating.metrics.http_metrics import (
+    create_http_client_active_requests,
+    create_http_client_request_body_size,
+    create_http_client_response_body_size,
+)
 from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.http_attributes import (
+    HTTP_REQUEST_METHOD,
+)
+from opentelemetry.semconv.attributes.server_attributes import (
+    SERVER_ADDRESS,
+    SERVER_PORT,
+)
 from opentelemetry.semconv.metrics import (
     MetricInstruments,  # type: ignore[reportDeprecated]
 )
@@ -293,6 +322,16 @@ def _get_span_name(method: str) -> str:
     if method == "_OTHER":
         method = "HTTP"
     return method
+
+
+def _get_content_length(headers: Any) -> int | None:
+    content_length = headers.get("Content-Length") if headers is not None else None
+    if content_length is None:
+        return None
+    try:
+        return int(content_length)
+    except ValueError:
+        return None
 
 
 def _set_http_status_code_attribute(
@@ -404,6 +443,10 @@ def create_trace_config(
             explicit_bucket_boundaries_advisory=HTTP_DURATION_HISTOGRAM_BUCKETS_OLD,
         )
     duration_histogram_new = None
+    active_requests = None
+    request_body_size = None
+    response_body_size = None
+    connection_pool_observer = None
     if _report_new(sem_conv_opt_in_mode):
         duration_histogram_new = meter.create_histogram(
             name=HTTP_CLIENT_REQUEST_DURATION,
@@ -411,6 +454,10 @@ def create_trace_config(
             description="Duration of HTTP client requests.",
             explicit_bucket_boundaries_advisory=HTTP_DURATION_HISTOGRAM_BUCKETS_NEW,
         )
+        active_requests = create_http_client_active_requests(meter)
+        request_body_size = create_http_client_request_body_size(meter)
+        response_body_size = create_http_client_response_body_size(meter)
+        connection_pool_observer = get_connection_pool_observer(meter)
 
     excluded_urls = get_excluded_urls("AIOHTTP_CLIENT")
 
@@ -420,6 +467,10 @@ def create_trace_config(
             context_api.detach(trace_config_ctx.token)
         if trace_config_ctx.span:
             trace_config_ctx.span.end()
+
+        if trace_config_ctx.active_requests_attributes is not None and active_requests is not None:
+            active_requests.add(-1, trace_config_ctx.active_requests_attributes)
+            trace_config_ctx.active_requests_attributes = None
 
         if trace_config_ctx.duration_histogram_old is not None:
             duration_attrs_old = cast(
@@ -446,6 +497,10 @@ def create_trace_config(
                 ),
             )
             trace_config_ctx.duration_histogram_new.record(elapsed_time, attributes=duration_attrs_new)
+            if request_body_size is not None and trace_config_ctx.request_body_size is not None:
+                request_body_size.record(trace_config_ctx.request_body_size, attributes=duration_attrs_new)
+            if response_body_size is not None and trace_config_ctx.response_body_size is not None:
+                response_body_size.record(trace_config_ctx.response_body_size, attributes=duration_attrs_new)
 
     async def on_request_start(
         _session: aiohttp.ClientSession,
@@ -527,7 +582,31 @@ def create_trace_config(
 
         trace_config_ctx.token = context_api.attach(trace.set_span_in_context(trace_config_ctx.span))
 
+        if active_requests is not None:
+            trace_config_ctx.active_requests_attributes = {
+                key: trace_config_ctx.metric_attributes[key]
+                for key in (HTTP_REQUEST_METHOD, SERVER_ADDRESS, SERVER_PORT)
+                if key in trace_config_ctx.metric_attributes
+            }
+            active_requests.add(1, trace_config_ctx.active_requests_attributes)
+            trace_config_ctx.request_body_size = _get_content_length(params.headers)
+        if connection_pool_observer is not None:
+            connection_pool_observer.add(_session.connector)
+
         inject(params.headers)
+
+    async def on_request_chunk_sent(
+        _session: aiohttp.ClientSession,
+        trace_config_ctx: types.SimpleNamespace,
+        params: aiohttp.TraceRequestChunkSentParams,
+    ):
+        if trace_config_ctx.span is None or request_body_size is None or not params.chunk:
+            return
+        if not trace_config_ctx.request_body_chunked:
+            # the body is sent in chunks, the Content-Length header is not needed
+            trace_config_ctx.request_body_chunked = True
+            trace_config_ctx.request_body_size = 0
+        trace_config_ctx.request_body_size += len(params.chunk)
 
     async def on_request_end(
         _session: aiohttp.ClientSession,
@@ -545,6 +624,8 @@ def create_trace_config(
             trace_config_ctx.metric_attributes,
             sem_conv_opt_in_mode,
         )
+        if response_body_size is not None:
+            trace_config_ctx.response_body_size = _get_content_length(params.response.headers)
 
         trace_config_ctx.span.set_attributes(
             get_custom_header_attributes(
@@ -591,6 +672,10 @@ def create_trace_config(
             url_filter=url_filter,
             excluded_urls=excluded_urls,
             start_time=0,
+            active_requests_attributes=None,
+            request_body_size=None,
+            request_body_chunked=False,
+            response_body_size=None,
             **kwargs,
         )
 
@@ -599,6 +684,7 @@ def create_trace_config(
     )
 
     trace_config.on_request_start.append(on_request_start)
+    trace_config.on_request_chunk_sent.append(on_request_chunk_sent)
     trace_config.on_request_end.append(on_request_end)
     trace_config.on_request_exception.append(on_request_exception)
 
