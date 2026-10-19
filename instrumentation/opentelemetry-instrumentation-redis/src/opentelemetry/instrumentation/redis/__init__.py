@@ -151,6 +151,21 @@ both old and stable HTTP conventions.
 By default, when the environment variable is not set, the old experimental
 database and HTTP conventions are emitted.
 
+Metrics
+*******
+
+With the ``database`` or ``database/dup`` opt-in the instrumentation reports:
+
+- ``db.client.operation.duration`` for commands and pipelines with the
+  ``db.system.name``, ``db.namespace``, ``db.operation.name`` (the command name,
+  ``BATCH <command>`` for a pipeline of identical commands, ``BATCH`` otherwise),
+  ``server.address``, ``server.port`` and, on failures, ``error.type`` attributes
+- ``db.client.connection.count`` (``idle``/``used``) and ``db.client.connection.max``
+  for the connection pools of the instrumented clients, with the
+  ``db.client.connection.pool.name`` attribute (``host:port/db``)
+
+A custom meter provider can be passed with ``instrument(meter_provider=...)``.
+
 API
 ---
 """
@@ -159,6 +174,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection
+from timeit import default_timer
 from typing import TYPE_CHECKING, Any
 
 import redis
@@ -170,9 +186,14 @@ from opentelemetry.instrumentation._semconv import (
     _get_semconv_opt_in_modes,
     _OpenTelemetrySemanticConventionStability,
     _OpenTelemetryStabilitySignalType,
+    _report_new,
     _set_db_statement,
 )
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
+from opentelemetry.instrumentation.redis._metrics import (
+    _pipeline_operation_name,
+    _RedisMetrics,
+)
 from opentelemetry.instrumentation.redis.package import _instruments
 from opentelemetry.instrumentation.redis.util import (
     _add_create_attributes,
@@ -187,6 +208,7 @@ from opentelemetry.instrumentation.utils import (
     is_instrumentation_enabled,
     unwrap,
 )
+from opentelemetry.metrics import MeterProvider, get_meter
 from opentelemetry.trace import (
     StatusCode,
     Tracer,
@@ -232,6 +254,12 @@ if _CLIENT_ASYNCIO_SUPPORT:
 _INSTRUMENTATION_ATTR = "_is_instrumented_by_opentelemetry"
 
 
+def _command_operation_name(args: tuple[Any, ...]) -> str | None:
+    if args and args[0]:
+        return str(args[0]).upper()
+    return None
+
+
 def _execute_hook(hook: Callable[..., None], *args: Any) -> None:
     try:
         hook(*args)
@@ -244,6 +272,7 @@ def _traced_execute_factory(
     tracer: Tracer,
     request_hook: RequestHook | None = None,
     response_hook: ResponseHook | None = None,
+    metrics: _RedisMetrics | None = None,
 ):
     sem_conv_opt_in_modes = _get_semconv_opt_in_modes(
         (
@@ -285,7 +314,16 @@ def _traced_execute_factory(
                     _add_create_attributes(span, args)
             if callable(request_hook):
                 _execute_hook(request_hook, span, instance, args, kwargs)
-            response = func(*args, **kwargs)
+            start = default_timer()
+            error = None
+            try:
+                response = func(*args, **kwargs)
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                if metrics is not None:
+                    metrics.record_operation(start, instance, _command_operation_name(args), error)
             if span.is_recording():
                 if span.name == "redis.search":
                     _add_search_attributes(span, response, args)
@@ -300,6 +338,7 @@ def _traced_execute_pipeline_factory(
     tracer: Tracer,
     request_hook: RequestHook | None = None,
     response_hook: ResponseHook | None = None,
+    metrics: _RedisMetrics | None = None,
 ):
     sem_conv_opt_in_modes = _get_semconv_opt_in_modes(
         (
@@ -310,7 +349,7 @@ def _traced_execute_pipeline_factory(
     db_sem_conv_opt_in_mode = sem_conv_opt_in_modes[_OpenTelemetryStabilitySignalType.DATABASE]
     http_sem_conv_opt_in_mode = sem_conv_opt_in_modes[_OpenTelemetryStabilitySignalType.HTTP]
 
-    def _traced_execute_pipeline(
+    def _traced_execute_pipeline(  # pylint: disable=too-many-locals
         func: Callable[..., R],
         instance: PipelineInstance,
         args: tuple[Any, ...],
@@ -343,11 +382,21 @@ def _traced_execute_pipeline_factory(
                 )
 
             response = None
+            operation_name = _pipeline_operation_name(command_stack)
+            start = default_timer()
+            error = None
             try:
                 response = func(*args, **kwargs)
             except redis.WatchError as watch_exception:
                 span.set_status(StatusCode.UNSET)
                 exception = watch_exception
+                error = watch_exception
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                if metrics is not None:
+                    metrics.record_operation(start, instance, operation_name, error)
 
             if callable(response_hook):
                 _execute_hook(response_hook, span, instance, response)
@@ -364,6 +413,7 @@ def _async_traced_execute_factory(
     tracer: Tracer,
     request_hook: RequestHook | None = None,
     response_hook: ResponseHook | None = None,
+    metrics: _RedisMetrics | None = None,
 ):
     sem_conv_opt_in_modes = _get_semconv_opt_in_modes(
         (
@@ -404,7 +454,16 @@ def _async_traced_execute_factory(
                 )
             if callable(request_hook):
                 _execute_hook(request_hook, span, instance, args, kwargs)
-            response = await func(*args, **kwargs)
+            start = default_timer()
+            error = None
+            try:
+                response = await func(*args, **kwargs)
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                if metrics is not None:
+                    metrics.record_operation(start, instance, _command_operation_name(args), error)
             if callable(response_hook):
                 _execute_hook(response_hook, span, instance, response)
             return response
@@ -416,6 +475,7 @@ def _async_traced_execute_pipeline_factory(
     tracer: Tracer,
     request_hook: RequestHook | None = None,
     response_hook: ResponseHook | None = None,
+    metrics: _RedisMetrics | None = None,
 ):
     sem_conv_opt_in_modes = _get_semconv_opt_in_modes(
         (
@@ -426,7 +486,7 @@ def _async_traced_execute_pipeline_factory(
     db_sem_conv_opt_in_mode = sem_conv_opt_in_modes[_OpenTelemetryStabilitySignalType.DATABASE]
     http_sem_conv_opt_in_mode = sem_conv_opt_in_modes[_OpenTelemetryStabilitySignalType.HTTP]
 
-    async def _async_traced_execute_pipeline(
+    async def _async_traced_execute_pipeline(  # pylint: disable=too-many-locals
         func: Callable[..., Awaitable[R]],
         instance: AsyncPipelineInstance,
         args: tuple[Any, ...],
@@ -461,11 +521,21 @@ def _async_traced_execute_pipeline_factory(
                 )
 
             response = None
+            operation_name = _pipeline_operation_name(command_stack)
+            start = default_timer()
+            error = None
             try:
                 response = await func(*args, **kwargs)
             except redis.WatchError as watch_exception:
                 span.set_status(StatusCode.UNSET)
                 exception = watch_exception
+                error = watch_exception
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                if metrics is not None:
+                    metrics.record_operation(start, instance, operation_name, error)
 
             if callable(response_hook):
                 _execute_hook(response_hook, span, instance, response)
@@ -483,9 +553,10 @@ def _instrument(
     tracer: Tracer,
     request_hook: RequestHook | None = None,
     response_hook: ResponseHook | None = None,
+    metrics: _RedisMetrics | None = None,
 ):
-    _traced_execute_command = _traced_execute_factory(tracer, request_hook, response_hook)
-    _traced_execute_pipeline = _traced_execute_pipeline_factory(tracer, request_hook, response_hook)
+    _traced_execute_command = _traced_execute_factory(tracer, request_hook, response_hook, metrics)
+    _traced_execute_pipeline = _traced_execute_pipeline_factory(tracer, request_hook, response_hook, metrics)
     pipeline_class = "BasePipeline" if _CLIENT_BEFORE_V3 else "Pipeline"
     redis_class = "StrictRedis" if _CLIENT_BEFORE_V3 else "Redis"
 
@@ -512,8 +583,10 @@ def _instrument(
             _traced_execute_pipeline,
         )
 
-    _async_traced_execute_command = _async_traced_execute_factory(tracer, request_hook, response_hook)
-    _async_traced_execute_pipeline = _async_traced_execute_pipeline_factory(tracer, request_hook, response_hook)
+    _async_traced_execute_command = _async_traced_execute_factory(tracer, request_hook, response_hook, metrics)
+    _async_traced_execute_pipeline = _async_traced_execute_pipeline_factory(
+        tracer, request_hook, response_hook, metrics
+    )
     if _CLIENT_ASYNCIO_SUPPORT:
         wrap_function_wrapper(
             "redis.asyncio",
@@ -548,10 +621,13 @@ def _instrument_client(
     tracer: Tracer,
     request_hook: RequestHook | None = None,
     response_hook: ResponseHook | None = None,
+    metrics: _RedisMetrics | None = None,
 ):
     # first, handle async clients and cluster clients
-    _async_traced_execute = _async_traced_execute_factory(tracer, request_hook, response_hook)
-    _async_traced_execute_pipeline = _async_traced_execute_pipeline_factory(tracer, request_hook, response_hook)
+    _async_traced_execute = _async_traced_execute_factory(tracer, request_hook, response_hook, metrics)
+    _async_traced_execute_pipeline = _async_traced_execute_pipeline_factory(
+        tracer, request_hook, response_hook, metrics
+    )
 
     if _CLIENT_ASYNCIO_SUPPORT and isinstance(client, redis.asyncio.Redis):
 
@@ -577,8 +653,8 @@ def _instrument_client(
         return
     # for redis.client.Redis, redis.Cluster and v3.0.0 redis.client.StrictRedis
     # the wrappers are the same
-    _traced_execute = _traced_execute_factory(tracer, request_hook, response_hook)
-    _traced_execute_pipeline = _traced_execute_pipeline_factory(tracer, request_hook, response_hook)
+    _traced_execute = _traced_execute_factory(tracer, request_hook, response_hook, metrics)
+    _traced_execute_pipeline = _traced_execute_pipeline_factory(tracer, request_hook, response_hook, metrics)
 
     def _pipeline_wrapper(func, instance, args, kwargs):
         result = func(*args, **kwargs)
@@ -616,6 +692,24 @@ class RedisInstrumentor(BaseInstrumentor):
             tracer_provider=tracer_provider,
             schema_url=_get_schema_url_for_signal_types(signal_types),
         )
+
+    @staticmethod
+    def _get_metrics(meter_provider: MeterProvider | None = None) -> _RedisMetrics | None:
+        _OpenTelemetrySemanticConventionStability._initialize()
+        if not _report_new(
+            _OpenTelemetrySemanticConventionStability._get_opentelemetry_stability_opt_in_mode(
+                _OpenTelemetryStabilitySignalType.DATABASE,
+            )
+        ):
+            # DB metrics are not supported without the database semconv opt-in
+            return None
+        meter = get_meter(
+            __name__,
+            __version__,
+            meter_provider,
+            schema_url=_get_schema_url_for_signal_types([_OpenTelemetryStabilitySignalType.DATABASE]),
+        )
+        return _RedisMetrics(meter)
 
     def instrument(
         self,
@@ -656,16 +750,22 @@ class RedisInstrumentor(BaseInstrumentor):
         Args:
             **kwargs: Optional arguments
                 ``tracer_provider``: a TracerProvider, defaults to global.
+                ``meter_provider``: a MeterProvider, defaults to global.
                 ``request_hook``: An optional callback that is invoked right after a span is created.
                 ``response_hook``: An optional callback which is invoked right before the span is finished processing a response.
         """
+        self._metrics = self._get_metrics(kwargs.get("meter_provider"))
         _instrument(
             self._get_tracer(**kwargs),
             request_hook=kwargs.get("request_hook"),
             response_hook=kwargs.get("response_hook"),
+            metrics=self._metrics,
         )
 
     def _uninstrument(self, **kwargs: Any):
+        if getattr(self, "_metrics", None) is not None:
+            self._metrics.clear()
+            self._metrics = None
         if _CLIENT_BEFORE_V3:
             unwrap(redis.StrictRedis, "execute_command")
             unwrap(redis.StrictRedis, "pipeline")
@@ -705,6 +805,7 @@ class RedisInstrumentor(BaseInstrumentor):
         tracer_provider: TracerProvider | None = None,
         request_hook: RequestHook | None = None,
         response_hook: ResponseHook | None = None,
+        meter_provider: MeterProvider | None = None,
     ):
         """Instrument the provided Redis Client. The client can be sync or async.
         Cluster client is also supported.
@@ -712,6 +813,7 @@ class RedisInstrumentor(BaseInstrumentor):
         Args:
             client: The redis client.
             tracer_provider: A TracerProvider, defaults to global.
+            meter_provider: A MeterProvider, defaults to global.
             request_hook: a function with extra user-defined logic to run before
                 performing the request.
 
@@ -736,6 +838,7 @@ class RedisInstrumentor(BaseInstrumentor):
                 RedisInstrumentor._get_tracer(tracer_provider=tracer_provider),
                 request_hook=request_hook,
                 response_hook=response_hook,
+                metrics=RedisInstrumentor._get_metrics(meter_provider),
             )
             setattr(client, _INSTRUMENTATION_ATTR, True)
         else:

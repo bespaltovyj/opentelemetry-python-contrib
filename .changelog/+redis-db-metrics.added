@@ -1,0 +1,1 @@
+`opentelemetry-instrumentation-redis`: with the `database` semconv opt-in, report `db.client.operation.duration` for commands and pipelines and the `db.client.connection.count`/`db.client.connection.max` pool metrics
