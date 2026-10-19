@@ -5,6 +5,7 @@ import os
 # pylint: disable=no-name-in-module
 from opentelemetry.instrumentation.asyncio.environment_variables import (
     OTEL_PYTHON_ASYNCIO_COROUTINE_NAMES_TO_TRACE,
+    OTEL_PYTHON_ASYNCIO_EVENT_LOOP_METRICS_ENABLED,
     OTEL_PYTHON_ASYNCIO_FUTURE_TRACE_ENABLED,
     OTEL_PYTHON_ASYNCIO_TO_THREAD_FUNCTION_NAMES_TO_TRACE,
 )
@@ -33,6 +34,14 @@ def get_future_trace_enabled() -> bool:
     default value is False
     """
     return os.getenv(OTEL_PYTHON_ASYNCIO_FUTURE_TRACE_ENABLED, "False").lower() == "true"
+
+
+def get_event_loop_metrics_enabled() -> bool:
+    """
+    Function to get the event loop metrics enabled flag from the environment variable
+    default value is False
+    """
+    return os.getenv(OTEL_PYTHON_ASYNCIO_EVENT_LOOP_METRICS_ENABLED, "False").lower() == "true"
 
 
 def get_to_thread_to_trace() -> set:

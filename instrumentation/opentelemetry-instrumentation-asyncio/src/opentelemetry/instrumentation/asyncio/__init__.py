@@ -68,6 +68,17 @@ asyncio metric types
 * asyncio.process.duration (seconds) - Duration of asyncio process
 * asyncio.process.created ({process}) - Number of asyncio process
 
+When ``OTEL_PYTHON_ASYNCIO_EVENT_LOOP_METRICS_ENABLED`` is ``true``, the event
+loops started after the instrumentation (and the loop running when
+``instrument()`` is called) are monitored:
+
+* asyncio.eventloop.delay (seconds) - Histogram of the delay of a callback
+  scheduled every 100ms, a high delay means that the loop is blocked
+* asyncio.task.count ({task}) - Number of tasks that are not done yet
+
+These metrics are not defined by the semantic conventions yet, the delay is
+modeled after ``nodejs.eventloop.delay``.
+
 API
 ---
 """
@@ -82,12 +93,14 @@ from typing import ParamSpec, TypeVar
 
 from wrapt import wrap_function_wrapper as _wrap
 
+from opentelemetry.instrumentation.asyncio._metrics import _EventLoopMetrics
 from opentelemetry.instrumentation.asyncio.instrumentation_state import (
     _is_instrumented,
 )
 from opentelemetry.instrumentation.asyncio.package import _instruments
 from opentelemetry.instrumentation.asyncio.utils import (
     get_coros_to_trace,
+    get_event_loop_metrics_enabled,
     get_future_trace_enabled,
     get_to_thread_to_trace,
 )
@@ -149,12 +162,36 @@ class AsyncioInstrumentor(BaseInstrumentor):
         self.instrument_to_thread()
         self.instrument_taskgroup_create_task()
 
+        self._event_loop_metrics = None
+        if get_event_loop_metrics_enabled():
+            self._event_loop_metrics = _EventLoopMetrics(self._meter)
+            self.instrument_event_loop()
+
     def _uninstrument(self, **kwargs):
         for method in self.methods_with_coroutine:
             uninstrument_method_with_coroutine(method)
         uninstrument_gather()
         uninstrument_to_thread()
         uninstrument_taskgroup_create_task()
+        if getattr(self, "_event_loop_metrics", None) is not None:
+            self._event_loop_metrics.stop()
+            self._event_loop_metrics = None
+            uninstrument_event_loop()
+
+    def instrument_event_loop(self) -> None:
+        """Monitors the event loops when they start to run, and the currently running loop."""
+        event_loop_metrics = self._event_loop_metrics
+
+        def wrap_run_forever(method, instance, args, kwargs):
+            event_loop_metrics.monitor(instance)
+            return method(*args, **kwargs)
+
+        _wrap(asyncio.BaseEventLoop, "run_forever", wrap_run_forever)
+        try:
+            event_loop_metrics.monitor(asyncio.get_running_loop())
+        except RuntimeError:
+            # no running event loop
+            pass
 
     def instrument_method_with_coroutine(self, method_name: str):
         """
@@ -362,6 +399,10 @@ def determine_state(exception: BaseException) -> str:
     if exception:
         return "exception"
     return "finished"
+
+
+def uninstrument_event_loop() -> None:
+    unwrap(asyncio.BaseEventLoop, "run_forever")
 
 
 def uninstrument_taskgroup_create_task() -> None:
