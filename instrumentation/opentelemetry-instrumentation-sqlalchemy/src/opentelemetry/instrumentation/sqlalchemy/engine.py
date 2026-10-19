@@ -3,6 +3,7 @@
 import os
 import re
 import weakref
+from timeit import default_timer
 
 import sqlalchemy
 from sqlalchemy.event import (  # pylint: disable=no-name-in-module
@@ -31,7 +32,22 @@ from opentelemetry.semconv._incubating.attributes.net_attributes import (
     NET_TRANSPORT,
     NetTransportValues,
 )
+from opentelemetry.semconv.attributes.db_attributes import (
+    DB_NAMESPACE,
+    DB_OPERATION_NAME,
+    DB_SYSTEM_NAME,
+)
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.semconv.attributes.server_attributes import (
+    SERVER_ADDRESS,
+    SERVER_PORT,
+)
 from opentelemetry.trace.status import Status, StatusCode
+
+# connection attributes which are also reported on the db.client.operation.duration metric
+_OPERATION_METRIC_CONNECTION_ATTRIBUTES = (DB_NAMESPACE, SERVER_ADDRESS, SERVER_PORT)
+_CREATE_START_KEY = "_otel_create_start"
+_CHECKOUT_TIME_KEY = "_otel_checkout_time"
 
 
 def _get_db_name_from_cursor_or_conn(vendor, conn, cursor):
@@ -110,6 +126,7 @@ def _wrap_create_async_engine(
     enable_commenter=False,
     commenter_options=None,
     enable_attribute_commenter=False,
+    pool_metrics=None,
 ):
     # pylint: disable=unused-argument
     def _wrap_create_async_engine_internal(func, module, args, kwargs):
@@ -127,6 +144,7 @@ def _wrap_create_async_engine(
             enable_commenter,
             commenter_options,
             enable_attribute_commenter,
+            pool_metrics=pool_metrics,
         )
         return engine
 
@@ -139,6 +157,7 @@ def _wrap_create_engine(
     enable_commenter=False,
     commenter_options=None,
     enable_attribute_commenter=False,
+    pool_metrics=None,
 ):
     def _wrap_create_engine_internal(func, _module, args, kwargs):
         """Trace the SQLAlchemy engine, creating an `EngineTracer`
@@ -155,10 +174,22 @@ def _wrap_create_engine(
             enable_commenter,
             commenter_options,
             enable_attribute_commenter,
+            pool_metrics=pool_metrics,
         )
         return engine
 
     return _wrap_create_engine_internal
+
+
+def _wrap_raw_connection(pool_metrics):
+    def _wrap_raw_connection_internal(func, instance, args, kwargs):
+        """Measure how long it takes to check a connection out of the pool."""
+        pool_name = pool_metrics.pool_name(instance)
+        if pool_name is None or not is_instrumentation_enabled():
+            return func(*args, **kwargs)
+        return pool_metrics.measure_wait(pool_name, func, args, kwargs)
+
+    return _wrap_raw_connection_internal
 
 
 def _wrap_connect(tracer):
@@ -205,6 +236,7 @@ class EngineTracer:
         enable_commenter=False,
         commenter_options=None,
         enable_attribute_commenter=False,
+        pool_metrics=None,
     ):
         # Initialize semantic conventions opt-in if needed
         _OpenTelemetrySemanticConventionStability._initialize()
@@ -227,6 +259,11 @@ class EngineTracer:
         self.enable_attribute_commenter = enable_attribute_commenter
         self._engine_attrs = _get_attributes_from_engine(engine)
         self._leading_comment_remover = re.compile(r"^/\*.*?\*/")
+        self._pool_metrics = pool_metrics
+        self._pool_name = self._engine_attrs["pool.name"]
+        if pool_metrics is not None:
+            pool_metrics.register(engine, self._pool_name)
+            self._register_event_listener(engine, "do_connect", self._pool_do_connect)
 
         self._register_event_listener(engine, "before_cursor_execute", self._before_cur_exec, retval=True)
         self._register_event_listener(engine, "after_cursor_execute", _after_cur_exec)
@@ -240,41 +277,79 @@ class EngineTracer:
         if not is_instrumentation_enabled():
             return
 
-        self.connections_usage.add(
-            value,
-            attributes={
-                **self._engine_attrs,
-                "state": "idle",
-            },
-        )
+        if self.connections_usage is not None:
+            self.connections_usage.add(
+                value,
+                attributes={
+                    **self._engine_attrs,
+                    "state": "idle",
+                },
+            )
+        if self._pool_metrics is not None:
+            self._pool_metrics.add_connection_count(self._pool_name, used=False, value=value)
 
     def _add_used_to_connection_usage(self, value):
         if not is_instrumentation_enabled():
             return
 
-        self.connections_usage.add(
-            value,
-            attributes={
-                **self._engine_attrs,
-                "state": "used",
-            },
-        )
+        if self.connections_usage is not None:
+            self.connections_usage.add(
+                value,
+                attributes={
+                    **self._engine_attrs,
+                    "state": "used",
+                },
+            )
+        if self._pool_metrics is not None:
+            self._pool_metrics.add_connection_count(self._pool_name, used=True, value=value)
 
-    def _pool_connect(self, _dbapi_connection, _connection_record):
+    # Called before a new DBAPI connection is created.
+    @staticmethod
+    def _pool_do_connect(_dialect, connection_record, _cargs, _cparams):
+        if connection_record is not None:
+            connection_record.info[_CREATE_START_KEY] = default_timer()
+
+    def _pool_connect(self, _dbapi_connection, connection_record):
         self._add_idle_to_connection_usage(1)
+        if self._pool_metrics is None or connection_record is None:
+            return
+        start = connection_record.info.pop(_CREATE_START_KEY, None)
+        if start is not None and is_instrumentation_enabled():
+            self._pool_metrics.create_time.record(
+                max(default_timer() - start, 0),
+                self._pool_metrics.pool_attributes(self._pool_name),
+            )
 
     def _pool_close(self, _dbapi_connection, _connection_record):
         self._add_idle_to_connection_usage(-1)
 
     # Called when a connection returns to the pool.
-    def _pool_checkin(self, _dbapi_connection, _connection_record):
+    def _pool_checkin(self, _dbapi_connection, connection_record):
         self._add_used_to_connection_usage(-1)
         self._add_idle_to_connection_usage(1)
+        if self._pool_metrics is None or connection_record is None:
+            return
+        checkout_time = connection_record.info.pop(_CHECKOUT_TIME_KEY, None)
+        if checkout_time is not None and is_instrumentation_enabled():
+            self._pool_metrics.use_time.record(
+                max(default_timer() - checkout_time, 0),
+                self._pool_metrics.pool_attributes(self._pool_name),
+            )
 
     # Called when a connection is retrieved from the Pool.
-    def _pool_checkout(self, _dbapi_connection, _connection_record, _connection_proxy):
+    def _pool_checkout(self, _dbapi_connection, connection_record, _connection_proxy):
         self._add_idle_to_connection_usage(-1)
         self._add_used_to_connection_usage(1)
+        if self._pool_metrics is not None and connection_record is not None:
+            connection_record.info[_CHECKOUT_TIME_KEY] = default_timer()
+
+    def _operation_metric_attributes(self, attrs, statement):
+        attributes = {key: attrs[key] for key in _OPERATION_METRIC_CONNECTION_ATTRIBUTES if key in attrs}
+        attributes[DB_SYSTEM_NAME] = self.vendor
+        operation = self._operation(statement)
+        if operation:
+            attributes[DB_OPERATION_NAME] = operation
+        return attributes
 
     @classmethod
     def _dispose_of_event_listener(cls, obj):
@@ -411,12 +486,30 @@ class EngineTracer:
                     self._set_db_client_span_attributes(span, statement, attrs)
 
         context._otel_span = span
+        if self._pool_metrics is not None:
+            context._otel_operation_metric = (
+                self._pool_metrics.operation_duration,
+                self._operation_metric_attributes(attrs, statement),
+                default_timer(),
+            )
 
         return statement, params
 
 
+def _record_operation_duration(execution_context, error=None):
+    operation_metric = getattr(execution_context, "_otel_operation_metric", None)
+    if operation_metric is None:
+        return
+    execution_context._otel_operation_metric = None
+    histogram, attributes, start = operation_metric
+    if error is not None:
+        attributes = {**attributes, ERROR_TYPE: type(error).__qualname__}
+    histogram.record(max(default_timer() - start, 0), attributes)
+
+
 # pylint: disable=unused-argument
 def _after_cur_exec(conn, cursor, statement, params, context, executemany):
+    _record_operation_duration(context)
     span = getattr(context, "_otel_span", None)
     if span is None:
         return
@@ -425,6 +518,7 @@ def _after_cur_exec(conn, cursor, statement, params, context, executemany):
 
 
 def _handle_error(context):
+    _record_operation_duration(context.execution_context, context.original_exception)
     span = getattr(context.execution_context, "_otel_span", None)
     if span is None:
         return

@@ -1,0 +1,1 @@
+`opentelemetry-instrumentation-sqlalchemy`: with the `database` semconv opt-in, report the `db.client.connection.*` pool metrics (count, max, idle.max, pending_requests, timeouts, create_time, wait_time, use_time) and `db.client.operation.duration`
