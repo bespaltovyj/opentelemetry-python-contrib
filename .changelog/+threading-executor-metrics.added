@@ -1,0 +1,1 @@
+`opentelemetry-instrumentation-threading`: add opt-in `ThreadPoolExecutor` metrics (`executor.pool.size`, `executor.pool.max`, `executor.queued`, `executor.active`, `executor.completed`, `executor.task.duration`, `executor.task.queue_time`) enabled with `OTEL_PYTHON_THREADING_EXECUTOR_METRICS_ENABLED=true`

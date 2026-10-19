@@ -13,20 +13,42 @@ Usage
     ThreadingInstrumentor().instrument()
 
 This library provides instrumentation for the `threading` module to ensure that
-the OpenTelemetry context is propagated across threads. It is important to note
-that this instrumentation does not produce any telemetry data on its own. It
-merely ensures that the context is correctly propagated when threads are used.
+the OpenTelemetry context is propagated across threads. By default this
+instrumentation does not produce any telemetry data on its own. It merely
+ensures that the context is correctly propagated when threads are used.
 
 
 When instrumented, new threads created using threading.Thread, threading.Timer,
 or within futures.ThreadPoolExecutor will have the current OpenTelemetry
 context attached, and this context will be re-activated in the thread's
 run method or the executor's worker thread."
+
+Executor metrics
+----------------
+
+Set the ``OTEL_PYTHON_THREADING_EXECUTOR_METRICS_ENABLED`` environment variable
+to ``true`` to report the following metrics for ``futures.ThreadPoolExecutor``,
+all with the ``executor.name`` attribute (the ``thread_name_prefix`` of the
+executor, or ``ThreadPoolExecutor`` when it was not set):
+
+- ``executor.pool.size`` and ``executor.pool.max``: current and maximum number of
+  worker threads
+- ``executor.queued``: number of tasks waiting in the queue
+- ``executor.active``: number of tasks being executed
+- ``executor.completed``: number of executed tasks, with ``error.type`` when the
+  task raised an exception
+- ``executor.task.duration`` and ``executor.task.queue_time``: execution time
+  and time spent in the queue
+
+These metrics are not defined by the semantic conventions yet; their names
+follow the executor metrics of Micrometer. A custom meter provider can be passed
+with ``instrument(meter_provider=...)``.
 """
 
 from __future__ import annotations
 
 import functools
+import os
 import threading
 from collections.abc import Callable, Collection
 from concurrent import futures
@@ -38,8 +60,13 @@ from wrapt import (
 
 from opentelemetry import context
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
+from opentelemetry.instrumentation.threading._metrics import ExecutorMetrics
 from opentelemetry.instrumentation.threading.package import _instruments
+from opentelemetry.instrumentation.threading.version import __version__
 from opentelemetry.instrumentation.utils import unwrap
+from opentelemetry.metrics import get_meter
+
+OTEL_PYTHON_THREADING_EXECUTOR_METRICS_ENABLED = "OTEL_PYTHON_THREADING_EXECUTOR_METRICS_ENABLED"
 
 if TYPE_CHECKING:
     from typing import Protocol, TypeVar
@@ -54,11 +81,15 @@ class ThreadingInstrumentor(BaseInstrumentor):
     __WRAPPER_START_METHOD = "start"
     __WRAPPER_RUN_METHOD = "run"
     __WRAPPER_SUBMIT_METHOD = "submit"
+    _executor_metrics: ExecutorMetrics | None = None
 
     def instrumentation_dependencies(self) -> Collection[str]:
         return _instruments
 
     def _instrument(self, **kwargs: Any):
+        if os.environ.get(OTEL_PYTHON_THREADING_EXECUTOR_METRICS_ENABLED, "false").strip().lower() == "true":
+            meter = get_meter(__name__, __version__, kwargs.get("meter_provider"))
+            ThreadingInstrumentor._executor_metrics = ExecutorMetrics(meter)
         self._instrument_thread()
         self._instrument_timer()
         self._instrument_thread_pool()
@@ -67,6 +98,7 @@ class ThreadingInstrumentor(BaseInstrumentor):
         self._uninstrument_thread()
         self._uninstrument_timer()
         self._uninstrument_thread_pool()
+        ThreadingInstrumentor._executor_metrics = None
 
     @staticmethod
     def _instrument_thread():
@@ -166,6 +198,11 @@ class ThreadingInstrumentor(BaseInstrumentor):
                 if token is not None:
                     context.detach(token)
 
+        task: Callable[..., Any] = wrapped_func
+        executor_metrics = ThreadingInstrumentor._executor_metrics
+        if executor_metrics is not None:
+            task = executor_metrics.wrap_task(instance, wrapped_func)
+
         # replace the original function with the wrapped function
-        new_args: tuple[Callable[..., Any], ...] = (wrapped_func,) + args[1:]
+        new_args: tuple[Callable[..., Any], ...] = (task,) + args[1:]
         return call_wrapped(*new_args, **kwargs)
