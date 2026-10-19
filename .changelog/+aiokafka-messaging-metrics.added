@@ -1,0 +1,1 @@
+`opentelemetry-instrumentation-aiokafka`: with the `messaging` semconv opt-in, report `messaging.client.operation.duration`, `messaging.client.sent.messages`, `messaging.client.consumed.messages` and the `messaging.kafka.consumer.lag` gauge

@@ -89,6 +89,28 @@ For example:
 
     asyncio.run(produce())
 
+Metrics
+*******
+
+When the ``OTEL_SEMCONV_STABILITY_OPT_IN`` environment variable contains
+``messaging`` (or ``messaging/dup``), the following metrics are reported with
+the ``messaging.system``, ``messaging.operation.name``,
+``messaging.destination.name``, ``messaging.destination.partition.id``,
+``messaging.consumer.group.name`` (consumers only) and, on failures,
+``error.type`` attributes:
+
+- ``messaging.client.operation.duration``: for ``send`` it is measured until the
+  broker acknowledged the message, for ``getone``/``getmany`` it is the duration
+  of the call
+- ``messaging.client.sent.messages``
+- ``messaging.client.consumed.messages``
+- ``messaging.kafka.consumer.lag``: gauge with the number of messages between
+  the last consumed offset and the high watermark of every assigned partition
+  (not defined by the semantic conventions yet)
+
+``messaging.process.duration`` is not reported because the records are
+processed by the application after ``getone``/``getmany`` returned.
+
 API
 ---
 """
@@ -105,6 +127,12 @@ from wrapt import (
 )
 
 from opentelemetry import trace
+from opentelemetry.instrumentation._semconv import (
+    _OpenTelemetrySemanticConventionStability,
+    _OpenTelemetryStabilitySignalType,
+    _report_new,
+)
+from opentelemetry.instrumentation.aiokafka._metrics import KafkaMetrics
 from opentelemetry.instrumentation.aiokafka.package import _instruments
 from opentelemetry.instrumentation.aiokafka.utils import (
     _wrap_getmany,
@@ -114,6 +142,7 @@ from opentelemetry.instrumentation.aiokafka.utils import (
 from opentelemetry.instrumentation.aiokafka.version import __version__
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.utils import unwrap
+from opentelemetry.metrics import MeterProvider, get_meter
 from opentelemetry.semconv.schemas import Schemas
 
 if TYPE_CHECKING:
@@ -125,6 +154,7 @@ if TYPE_CHECKING:
 
     class InstrumentKwargs(TypedDict, total=False):
         tracer_provider: trace.TracerProvider
+        meter_provider: MeterProvider
         async_produce_hook: ProduceHookT
         async_consume_hook: ConsumeHookT
 
@@ -146,6 +176,7 @@ class AIOKafkaInstrumentor(BaseInstrumentor):
         Args:
             **kwargs: Optional arguments
                 ``tracer_provider``: a TracerProvider, defaults to global.
+                ``meter_provider``: a MeterProvider, defaults to global.
                 ``async_produce_hook``: a callable to be executed just before producing a message
                 ``async_consume_hook``: a callable to be executed just after consuming a message
         """
@@ -166,20 +197,35 @@ class AIOKafkaInstrumentor(BaseInstrumentor):
             schema_url=Schemas.V1_27_0.value,
         )
 
+        _OpenTelemetrySemanticConventionStability._initialize()
+        metrics = None
+        if _report_new(
+            _OpenTelemetrySemanticConventionStability._get_opentelemetry_stability_opt_in_mode(
+                _OpenTelemetryStabilitySignalType.MESSAGING,
+            )
+        ):
+            meter = get_meter(
+                __name__,
+                __version__,
+                meter_provider=kwargs.get("meter_provider"),
+                schema_url=Schemas.V1_27_0.value,
+            )
+            metrics = KafkaMetrics(meter)
+
         wrap_function_wrapper(
             aiokafka.AIOKafkaProducer,
             "send",
-            _wrap_send(tracer, async_produce_hook),
+            _wrap_send(tracer, async_produce_hook, metrics),
         )
         wrap_function_wrapper(
             aiokafka.AIOKafkaConsumer,
             "getone",
-            _wrap_getone(tracer, async_consume_hook),
+            _wrap_getone(tracer, async_consume_hook, metrics),
         )
         wrap_function_wrapper(
             aiokafka.AIOKafkaConsumer,
             "getmany",
-            _wrap_getmany(tracer, async_consume_hook),
+            _wrap_getmany(tracer, async_consume_hook, metrics),
         )
 
     def _uninstrument(self, **kwargs: Unpack[UninstrumentKwargs]):

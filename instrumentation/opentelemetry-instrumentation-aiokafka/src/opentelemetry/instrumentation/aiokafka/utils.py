@@ -8,6 +8,7 @@ import contextlib
 import json
 from collections.abc import Awaitable, Callable, MutableSequence, Sequence
 from logging import getLogger
+from timeit import default_timer
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -19,6 +20,7 @@ import aiokafka
 
 from opentelemetry import context, propagate, trace
 from opentelemetry.context import Context
+from opentelemetry.instrumentation.aiokafka._metrics import KafkaMetrics
 from opentelemetry.propagators import textmap
 from opentelemetry.semconv._incubating.attributes import messaging_attributes
 from opentelemetry.semconv.attributes import server_attributes
@@ -371,7 +373,9 @@ def _get_span_name(operation: str, topic: str):
 
 
 def _wrap_send(  # type: ignore[reportUnusedFunction]
-    tracer: Tracer, async_produce_hook: ProduceHookT | None
+    tracer: Tracer,
+    async_produce_hook: ProduceHookT | None,
+    metrics: KafkaMetrics | None = None,
 ) -> Callable[..., Awaitable[asyncio.Future[RecordMetadata]]]:
     async def _traced_send(
         func: AIOKafkaSendProto,
@@ -411,7 +415,16 @@ def _wrap_send(  # type: ignore[reportUnusedFunction]
             except Exception as hook_exception:  # pylint: disable=W0703
                 _LOG.exception(hook_exception)
 
-        return await func(*args, **kwargs)
+        if metrics is None:
+            return await func(*args, **kwargs)
+        start = default_timer()
+        try:
+            future = await func(*args, **kwargs)
+        except BaseException as exception:
+            metrics.record_send(start, topic, partition, exception)
+            raise
+        metrics.record_send_result(start, topic, partition, future)
+        return future
 
     return _traced_send
 
@@ -457,7 +470,9 @@ async def _create_consumer_span(
 
 
 def _wrap_getone(  # type: ignore[reportUnusedFunction]
-    tracer: Tracer, async_consume_hook: ConsumeHookT | None
+    tracer: Tracer,
+    async_consume_hook: ConsumeHookT | None,
+    metrics: KafkaMetrics | None = None,
 ) -> Callable[..., Awaitable[aiokafka.ConsumerRecord[object, object]]]:
     async def _traced_getone(
         func: AIOKafkaGetOneProto,
@@ -465,7 +480,21 @@ def _wrap_getone(  # type: ignore[reportUnusedFunction]
         args: tuple[aiokafka.TopicPartition, ...],
         kwargs: dict[str, Any],
     ) -> aiokafka.ConsumerRecord[object, object]:
-        record = await func(*args, **kwargs)
+        start = default_timer()
+        try:
+            record = await func(*args, **kwargs)
+        except BaseException as exception:
+            if metrics is not None:
+                metrics.record_receive(start, instance, _extract_consumer_group(instance), {}, exception)
+            raise
+        if metrics is not None:
+            metrics.record_receive(
+                start,
+                instance,
+                _extract_consumer_group(instance),
+                {aiokafka.TopicPartition(record.topic, record.partition): [record]} if record else {},
+                None,
+            )
 
         if record:
             bootstrap_servers = _extract_bootstrap_servers(instance._client)
@@ -490,7 +519,9 @@ def _wrap_getone(  # type: ignore[reportUnusedFunction]
 
 
 def _wrap_getmany(  # type: ignore[reportUnusedFunction]
-    tracer: Tracer, async_consume_hook: ConsumeHookT | None
+    tracer: Tracer,
+    async_consume_hook: ConsumeHookT | None,
+    metrics: KafkaMetrics | None = None,
 ) -> Callable[
     ...,
     Awaitable[
@@ -500,13 +531,21 @@ def _wrap_getmany(  # type: ignore[reportUnusedFunction]
         ]
     ],
 ]:
-    async def _traced_getmany(
+    async def _traced_getmany(  # pylint: disable=too-many-locals
         func: AIOKafkaGetManyProto,
         instance: aiokafka.AIOKafkaConsumer,
         args: tuple[aiokafka.TopicPartition, ...],
         kwargs: dict[str, Any],
     ) -> dict[aiokafka.TopicPartition, list[aiokafka.ConsumerRecord[object, object]]]:
-        records = await func(*args, **kwargs)
+        start = default_timer()
+        try:
+            records = await func(*args, **kwargs)
+        except BaseException as exception:
+            if metrics is not None:
+                metrics.record_receive(start, instance, _extract_consumer_group(instance), {}, exception)
+            raise
+        if metrics is not None:
+            metrics.record_receive(start, instance, _extract_consumer_group(instance), records or {}, None)
 
         if records:
             bootstrap_servers = _extract_bootstrap_servers(instance._client)
